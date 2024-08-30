@@ -28,6 +28,21 @@ import (
 	"course/labrpc"
 )
 
+const (
+	electionTimeoutMin time.Duration = 250 * time.Millisecond
+	electionTimeoutMax time.Duration = 400 * time.Millisecond
+)
+
+func (rf *Raft) resetElectionTimerLocked() {
+	rf.electionStart = time.Now()
+	randRange := int64(electionTimeoutMax - electionTimeoutMin)
+	rf.electionTimeout = electionTimeoutMin + time.Duration(rand.Int63()%randRange)
+}
+
+func (rf *Raft) isElectionTimeoutLocked() bool {
+	return time.Since(rf.electionStart) > rf.electionTimeout
+}
+
 type Role string
 
 const (
@@ -174,17 +189,48 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (PartA, PartB).
+	Term        int
+	CandidateId int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (PartA).
+	Term        int
+	VoteGranted bool
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (PartA, PartB).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+
+	// align term
+	if args.Term < rf.currentTerm {
+		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Reject vote, higher term, T%d>T%d", args.CandidateId, rf.currentTerm, args.Term)
+		reply.VoteGranted = false
+		return
+	}
+	if args.Term > rf.currentTerm {
+		rf.becomeFollowerLocked(args.Term)
+	}
+
+	// check for votedFor (if voted on this term)
+	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
+		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Rejected, Already voted to S%d", args.CandidateId, rf.votedFor)
+		reply.VoteGranted = false
+		return
+	}
+
+	reply.VoteGranted = true
+	rf.votedFor = args.CandidateId
+	rf.resetElectionTimerLocked()
+	LOG(rf.me, rf.currentTerm, DVote, "->S%d, Vote granted", args.CandidateId)
+
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -260,12 +306,82 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) ticker() {
-	for rf.killed() == false {
+func (rf *Raft) contextLostLocked(role Role, term int) bool {
+	return rf.currentTerm == term && rf.role == role
+}
+
+func (rf *Raft) startElection(term int) {
+	votes := 0
+
+	// single RPC
+	askVoteFromPeer := func(peer int, args *RequestVoteArgs) {
+		reply := &RequestVoteReply{}
+		ok := rf.sendRequestVote(peer, args, reply)
+
+		// handle the response
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+
+		if ok {
+			LOG(rf.me, rf.currentTerm, DDebug, "Request Vote from S%d. Lost or error", peer)
+			return
+		}
+
+		// align term
+		if reply.Term > rf.currentTerm {
+			rf.becomeFollowerLocked(reply.Term)
+			return
+		}
+
+		// check the context
+		if rf.contextLostLocked(Candidate, term) {
+			LOG(rf.me, rf.currentTerm, DVote, "Lost context. Abort RequestsVoteReply for S%d", peer)
+			return
+		}
+
+		// count the votes
+		if reply.VoteGranted {
+			votes++
+			if votes > len(rf.peers)/2 {
+				rf.becomeLeaderLocked()
+				go rf.replicationTicker(term)
+			}
+		}
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.contextLostLocked(Candidate, term) {
+		LOG(rf.me, rf.currentTerm, DVote, "Lost Candidate to %s, abort RequestVote", rf.role)
+		return
+	}
+
+	for peer := 0; peer < len(rf.peers); peer++ {
+		if peer != rf.me {
+			votes++
+			continue
+		}
+
+		args := &RequestVoteArgs{
+			Term:        rf.currentTerm,
+			CandidateId: rf.me,
+		}
+
+		go askVoteFromPeer(peer, args)
+	}
+}
+
+func (rf *Raft) electionTicker() {
+	for !rf.killed() {
 
 		// Your code here (PartA)
 		// Check if a leader election should be started.
-
+		rf.mu.Lock()
+		if rf.role != Leader && rf.isElectionTimeoutLocked() {
+			rf.becomeCandidateLocked()
+			go rf.startElection(rf.currentTerm)
+		}
+		rf.mu.Unlock()
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
 		ms := 50 + (rand.Int63() % 300)
@@ -298,7 +414,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
-	go rf.ticker()
+	go rf.electionTicker()
 
 	return rf
 }
